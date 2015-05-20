@@ -85,10 +85,33 @@ typedef struct {
     uint32_t step;       ///< AWG step interval.
 } awg_param_t;
 
+/* Synthesizer options */
+
+struct synth_sin_params {
+};
+
+struct synth_sqr_params {
+    double dcycle;	///< Duty cycle
+};
+
+struct synth_tri_params {
+};
+
+struct generate_params {
+    double ampl;
+    double freq;
+    double endfreq;
+    signal_e type;
+    union {
+        struct synth_sin_params sin;
+        struct synth_sqr_params sqr;
+        struct synth_tri_params tri;
+    } opts;
+};
+
 /* Forward declarations */
-void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
-                       int32_t *data,
-                       awg_param_t *params);
+void synthesize_signal(struct generate_params *gparams, int32_t *data,
+                     awg_param_t *awg);
 void write_data_fpga(uint32_t ch,
                      const int32_t *data,
                      const awg_param_t *awg);
@@ -112,10 +135,51 @@ void usage() {
              g_argv0, c_max_amplitude, c_min_frequency, c_max_frequency);
 }
 
+static int
+parse_nvpair(char *nvpair, char **name, char **value)
+{
+    char *p;
+
+    p = strchr(nvpair, '=');
+    if (p == NULL) {
+        return (-1);
+    }
+    *p = '\0';
+    *name = nvpair;
+    *value = p + 1;
+    return (0);
+}
+
+static int
+parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
+{
+
+    switch (gpp->type) {
+    case eSignalSquare:
+        if (strcmp(name, "dcycle") == 0) {
+            double dcycle;
+
+            dcycle = strtod(value, NULL);
+            if (dcycle <= 0.0 || dcycle >= 1.0)
+                return (-1);
+            gpp->opts.sqr.dcycle = dcycle;
+            return (0);
+        }
+        break;
+
+    default:
+        break;
+    }
+    return (-1);
+}
 
 /** Signal generator main */
 int main(int argc, char *argv[])
 {
+    int i;
+    char *name, *value;
+    struct generate_params gparams;
+
     g_argv0 = argv[0];    
 
     if ( argc < 4 ) {
@@ -133,33 +197,29 @@ int main(int argc, char *argv[])
     }
 
     /* Signal amplitude argument parsing */
-    double ampl = strtod(argv[2], NULL);
-    if ( (ampl < 0.0) || (ampl > c_max_amplitude) ) {
+    gparams.ampl = strtod(argv[2], NULL);
+    if ( (gparams.ampl < 0.0) || (gparams.ampl > c_max_amplitude) ) {
         fprintf(stderr, "Invalid amplitude: %s\n", argv[2]);
         usage();
         return -1;
     }
 
     /* Signal frequency argument parsing */
-    double freq = strtod(argv[3], NULL);
-    double endfreq;
-    endfreq = 0;
-
-    if (argc > 5) {
-        endfreq = strtod(argv[5], NULL);
-    }
+    gparams.freq = strtod(argv[3], NULL);
+    gparams.endfreq = 0;
 
     /* Signal type argument parsing */
-    signal_e type = eSignalSine;
+    gparams.type = eSignalSine;
     if (argc > 4) {
         if ( strcmp(argv[4], "sine") == 0) {
-            type = eSignalSine;
+            gparams.type = eSignalSine;
         } else if ( strcmp(argv[4], "sqr") == 0) {
-            type = eSignalSquare;
+            gparams.type = eSignalSquare;
+            gparams.opts.sqr.dcycle = 0.5;
         } else if ( strcmp(argv[4], "tri") == 0) {
-            type = eSignalTriangle;
+            gparams.type = eSignalTriangle;
         } else if ( strcmp(argv[4], "sweep") == 0) {
-            type = eSignalSweep;   
+            gparams.type = eSignalSweep;   
         } else {
             fprintf(stderr, "Invalid signal type: %s\n", argv[4]);
             usage();
@@ -167,20 +227,36 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (argc > 5) {
+        for (i = 5; i < argc; i++) {
+            if (parse_nvpair(argv[i], &name, &value) == -1)
+                break;
+            if (parse_nvparam(&gparams, name, value) == -1) {
+                fprintf(stderr, "Invalid name/value parameter: %s=%s\n", 
+                    name, value);
+                usage();
+                return (-1);
+            }
+        }
+        if (i < argc) {
+            gparams.endfreq = strtod(argv[i], NULL);
+        }
+    }
+
     /* Check frequency limits */
-    if ( (freq < c_min_frequency) || (freq > c_max_frequency ) ) {
+    if ( (gparams.freq < c_min_frequency) || (gparams.freq > c_max_frequency ) ) {
         fprintf(stderr, "Invalid frequency: %s\n", argv[3]);
         usage();
         return -1;
     }
 
-    awg_param_t params;
     /* Prepare data buffer (calculate from input arguments) */
-    
-    synthesize_signal(ampl, freq, type, endfreq, data, &params);
+    awg_param_t awg_params;
+
+    synthesize_signal(&gparams, data, &awg_params);
 
     /* Write the data to the FPGA and set FPGA AWG state machine */
-    write_data_fpga(ch, data, &params);
+    write_data_fpga(ch, data, &awg_params);
 }
 
 /**
@@ -190,19 +266,17 @@ int main(int argc, char *argv[])
  * types/shapes, signal amplitude & frequency. The data[] vector of 
  * samples at 125 MHz is generated to be re-played by the FPGA AWG module.
  *
- * @param ampl  Signal amplitude [Vpp].
- * @param freq  Signal frequency [Hz].
- * @param type  Signal type/shape [Sine, Square, Triangle].
+ * @param gpp->ampl  Signal amplitude [Vpp].
+ * @param gpp->freq  Signal frequency [Hz].
+ * @param gpp->type  Signal type/shape [Sine, Square, Triangle].
  * @param data  Returned synthesized AWG data vector.
  * @param awg   Returned AWG parameters.
  *
  */
-void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
-                       int32_t *data,
+void synthesize_signal(struct generate_params *gpp, int32_t *data,
                        awg_param_t *awg) {
 
     uint32_t i;
-    double dcycle = 0.5;
     double y_thrs, rdata;
     struct recfilter lp_fil;
 
@@ -211,21 +285,21 @@ void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
 
     /* This is where frequency is used... */
     awg->offsgain = (dcoffs << 16) + 0x1fff;
-    awg->step = round(65536 * freq/c_awg_smpl_freq * n);
+    awg->step = round(65536 * gpp->freq/c_awg_smpl_freq * n);
     awg->wrap = round(65536 * (n-1));
 
-    uint32_t amp = ampl * 4000.0;    /* 1 Vpp ==> 4000 DAC counts */
+    uint32_t amp = gpp->ampl * 4000.0;    /* 1 Vpp ==> 4000 DAC counts */
     if (amp > 8191) {
         /* Truncate to max value if needed */
         amp = 8191;
     }
 
-    if (type == eSignalSquare) {
+    if (gpp->type == eSignalSquare) {
         double srate, fcoeff;
 
-        srate = freq * (double)n;
+        srate = gpp->freq * (double)n;
         fcoeff = calc_f_coef(srate, c_awg_smpl_freq / 2.0);
-        y_thrs = cos(dcycle * M_PI);
+        y_thrs = cos(gpp->opts.sqr.dcycle * M_PI);
         recfilter_init(&lp_fil, fcoeff, amp, 0);
     }
 
@@ -233,12 +307,12 @@ void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
     for(i = 0; i < n; i++) {
         
         /* Sine */
-        if (type == eSignalSine) {
+        if (gpp->type == eSignalSine) {
             data[i] = round(amp * cos(2*M_PI*(double)i/(double)n));
         }
  
         /* Square */
-        if (type == eSignalSquare) {
+        if (gpp->type == eSignalSquare) {
             rdata = cos(2*M_PI*(double)i/(double)n);
             if (rdata > y_thrs) {
                 data[i] = round(recfilter_apply_int(&lp_fil, amp));
@@ -248,16 +322,16 @@ void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
         }
         
         /* Triangle */
-        if (type == eSignalTriangle) {
+        if (gpp->type == eSignalTriangle) {
             data[i] = round(-1.0*(double)amp*(acos(cos(2*M_PI*(double)i/(double)n))/M_PI*2-1));
         }
 
         /* Sweep */
         /* Loops from i = 0 to n = 16*1024. Generates a sine wave signal that
            changes in frequency as the buffer is filled. */
-        double start = 2 * M_PI * freq;
-        double end = 2 * M_PI * endfreq;
-        if (type == eSignalSweep) {
+        double start = 2 * M_PI * gpp->freq;
+        double end = 2 * M_PI * gpp->endfreq;
+        if (gpp->type == eSignalSweep) {
             double sampFreq = c_awg_smpl_freq; // 125 MHz
             double t = i / sampFreq; // This particular sample
             double T = n / sampFreq; // Wave period = # samples / sample frequency
