@@ -20,6 +20,7 @@
 
 #include "fpga_awg.h"
 #include "version.h"
+#include "recfilter.h"
 
 /**
  * GENERAL DESCRIPTION:
@@ -201,29 +202,32 @@ void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
                        awg_param_t *awg) {
 
     uint32_t i;
+    double dcycle = 0.5;
+    double y_thrs, rdata;
+    struct recfilter lp_fil;
 
     /* Various locally used constants - HW specific parameters */
     const int dcoffs = -155;
-    const int trans0 = 30;
-    const int trans1 = 300;
-    const double tt2 = 0.249;
 
     /* This is where frequency is used... */
     awg->offsgain = (dcoffs << 16) + 0x1fff;
     awg->step = round(65536 * freq/c_awg_smpl_freq * n);
     awg->wrap = round(65536 * (n-1));
 
-    int trans = freq / 1e6 * trans1; /* 300 samples at 1 MHz */
     uint32_t amp = ampl * 4000.0;    /* 1 Vpp ==> 4000 DAC counts */
     if (amp > 8191) {
         /* Truncate to max value if needed */
         amp = 8191;
     }
 
-    if (trans <= 10) {
-        trans = trans0;
-    }
+    if (type == eSignalSquare) {
+        double srate, fcoeff;
 
+        srate = freq * (double)n;
+        fcoeff = calc_f_coef(srate, c_awg_smpl_freq / 2.0);
+        y_thrs = cos(dcycle * M_PI);
+        recfilter_init(&lp_fil, fcoeff, amp, 0);
+    }
 
     /* Fill data[] with appropriate buffer samples */
     for(i = 0; i < n; i++) {
@@ -235,47 +239,11 @@ void synthesize_signal(double ampl, double freq, signal_e type, double endfreq,
  
         /* Square */
         if (type == eSignalSquare) {
-            data[i] = round(amp * cos(2*M_PI*(double)i/(double)n));
-            if (data[i] > 0)
-                data[i] = amp;
-            else 
-                data[i] = -amp;
-
-            /* Soft linear transitions */
-            double mm, qq, xx, xm;
-            double x1, x2, y1, y2;    
-
-            xx = i;       
-            xm = n;
-            mm = -2.0*(double)amp/(double)trans; 
-            qq = (double)amp * (2 + xm/(2.0*(double)trans));
-            
-            x1 = xm * tt2;
-            x2 = xm * tt2 + (double)trans;
-            
-            if ( (xx > x1) && (xx <= x2) ) {  
-                
-                y1 = (double)amp;
-                y2 = -(double)amp;
-                
-                mm = (y2 - y1) / (x2 - x1);
-                qq = y1 - mm * x1;
-
-                data[i] = round(mm * xx + qq); 
-            }
-            
-            x1 = xm * 0.75;
-            x2 = xm * 0.75 + trans;
-            
-            if ( (xx > x1) && (xx <= x2)) {  
-                    
-                y1 = -(double)amp;
-                y2 = (double)amp;
-                
-                mm = (y2 - y1) / (x2 - x1);
-                qq = y1 - mm * x1;
-                
-                data[i] = round(mm * xx + qq); 
+            rdata = cos(2*M_PI*(double)i/(double)n);
+            if (rdata > y_thrs) {
+                data[i] = round(recfilter_apply_int(&lp_fil, amp));
+            } else {
+                data[i] = round(recfilter_apply_int(&lp_fil, -amp));
             }
         }
         

@@ -18,7 +18,7 @@ VERSION ?= 0.00-0000
 REVISION ?= devbuild
 
 # List of compiled object files (not yet linked to executable)
-OBJS = fpga_awg.o generate.o
+OBJS = fpga_awg.o generate.o recfilter.o
 # List of raw source files (all object files, renamed from .o to .c)
 SRCS = $(subst .o,.c, $(OBJS)))
 
