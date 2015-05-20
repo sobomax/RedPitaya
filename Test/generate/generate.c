@@ -92,6 +92,7 @@ struct synth_sin_params {
 
 struct synth_sqr_params {
     double dcycle;	///< Duty cycle
+    double bw;          ///< Bandwidth
 };
 
 struct synth_tri_params {
@@ -100,6 +101,7 @@ struct synth_tri_params {
 struct generate_params {
     double ampl;
     double freq;
+    double dc_off;
     double endfreq;
     signal_e type;
     union {
@@ -165,10 +167,31 @@ parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
             gpp->opts.sqr.dcycle = dcycle;
             return (0);
         }
+        if (strcmp(name, "bw") == 0) {
+            double bw;
+
+            bw = strtod(value, NULL);
+            if (bw <= 0 || bw > c_max_frequency) {
+                return (-1);
+            }
+            gpp->opts.sqr.bw = bw;
+            return (0);
+        }
         break;
 
     default:
         break;
+    }
+    /* Global params */
+    if (strcmp(name, "dcoff") == 0) {
+        double dc_off;
+
+        dc_off = strtod(value, NULL);
+        if (fabs(dc_off) + gpp->ampl > c_max_amplitude) {
+            return (-1);
+        }
+        gpp->dc_off = dc_off;
+        return (0);
     }
     return (-1);
 }
@@ -210,12 +233,14 @@ int main(int argc, char *argv[])
 
     /* Signal type argument parsing */
     gparams.type = eSignalSine;
+    gparams.dc_off = 0.0;
     if (argc > 4) {
         if ( strcmp(argv[4], "sine") == 0) {
             gparams.type = eSignalSine;
         } else if ( strcmp(argv[4], "sqr") == 0) {
             gparams.type = eSignalSquare;
             gparams.opts.sqr.dcycle = 0.5;
+            gparams.opts.sqr.bw = c_max_frequency;
         } else if ( strcmp(argv[4], "tri") == 0) {
             gparams.type = eSignalTriangle;
         } else if ( strcmp(argv[4], "sweep") == 0) {
@@ -289,16 +314,17 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
     awg->wrap = round(65536 * (n-1));
 
     uint32_t amp = gpp->ampl * 4000.0;    /* 1 Vpp ==> 4000 DAC counts */
-    if (amp > 8191) {
+    int32_t dc_of = gpp->dc_off * 4000.0;
+    if (amp + abs(dc_of) > 8191) {
         /* Truncate to max value if needed */
-        amp = 8191;
+        amp = 8191 - abs(dc_of);
     }
 
     if (gpp->type == eSignalSquare) {
         double srate, fcoeff;
 
         srate = gpp->freq * (double)n;
-        fcoeff = calc_f_coef(srate, c_awg_smpl_freq / 2.0);
+        fcoeff = calc_f_coef(srate, gpp->opts.sqr.bw);
         y_thrs = cos(gpp->opts.sqr.dcycle * M_PI);
         recfilter_init(&lp_fil, fcoeff, amp, 0);
     }
@@ -338,7 +364,9 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
             /* Actual formula. Frequency changes from start to end. */
             data[i] = round(amp * (sin((start*T)/log(end/start) * ((exp(t*log(end/start)/T)-1)))));
         }
-        
+        /* Add DC offset */
+        data[i] += dc_of;
+ 
         /* TODO: Remove, not necessary in C/C++. */
         if(data[i] < 0)
             data[i] += (1 << 14);
