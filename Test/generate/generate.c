@@ -313,8 +313,8 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
     awg->step = round(65536 * gpp->freq/c_awg_smpl_freq * n);
     awg->wrap = round(65536 * (n-1));
 
-    uint32_t amp = gpp->ampl * 4000.0;    /* 1 Vpp ==> 4000 DAC counts */
-    int32_t dc_of = gpp->dc_off * 4000.0;
+    uint32_t amp = gpp->ampl * 8000.0 / 2;    /* 1 Vpp ==> 8000 DAC counts, from -4000 to 4000 */
+    int32_t dc_of = gpp->dc_off * 8000.0;
     if (amp + abs(dc_of) > 8191) {
         /* Truncate to max value if needed */
         amp = 8191 - abs(dc_of);
