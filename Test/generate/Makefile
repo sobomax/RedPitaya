@@ -17,17 +17,23 @@
 VERSION ?= 0.00-0000
 REVISION ?= devbuild
 
+FFT_DIR=./external/kiss_fft
+FFT_OBJECTS=$(FFT_DIR)/kiss_fft.o $(FFT_DIR)/kiss_fftr.o
+FFT_INC=-I$(FFT_DIR)
+
 # List of compiled object files (not yet linked to executable)
-OBJS = fpga_awg.o generate.o recfilter.o
+OBJS = fpga_awg.o generate.o $(FFT_OBJECTS)
 # List of raw source files (all object files, renamed from .o to .c)
 SRCS = $(subst .o,.c, $(OBJS)))
 
 # Executable name
 TARGET=generate
 
+INCLUDE=$(FFT_INC)
+
 # GCC compiling & linking flags
 CFLAGS=-g -std=gnu99 -Wall -Werror
-CFLAGS += -DVERSION=$(VERSION) -DREVISION=$(REVISION)
+CFLAGS += $(INCLUDE) -DVERSION=$(VERSION) -DREVISION=$(REVISION)
 
 # Red Pitaya common SW directory
 SHARED=../../shared/
@@ -53,6 +59,9 @@ INSTALL_DIR ?= .
 #   - list od <dependencies> finished
 #   - all <commands> in the body of targets are executed succsesfully
 
+$(FFT_OBJECTS):
+	$(MAKE) -C $(FFT_DIR)
+
 # Main Makefile target 'all' - it iterates over all targets listed in $(TARGET)
 # variable.
 all: $(TARGET)
@@ -75,7 +84,7 @@ version.h:
 
 # Clean target - when called it cleans all object files and executables.
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) $(OBJS)
 
 # Install target - creates 'bin/' sub-directory in $(INSTALL_DIR) and copies all
 # executables to that location.

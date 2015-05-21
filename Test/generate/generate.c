@@ -20,7 +20,7 @@
 
 #include "fpga_awg.h"
 #include "version.h"
-#include "recfilter.h"
+#include "kiss_fftr.h"
 
 /**
  * GENERAL DESCRIPTION:
@@ -92,18 +92,18 @@ struct synth_sin_params {
 
 struct synth_sqr_params {
     double dcycle;	///< Duty cycle
-    double bw;          ///< Bandwidth
 };
 
 struct synth_tri_params {
 };
 
 struct generate_params {
-    double ampl;
-    double freq;
-    double dc_off;
-    double endfreq;
-    signal_e type;
+    double ampl;	///< P2P amplitude
+    double freq;	///< Frequency
+    double dc_off;	///< DC Offset
+    double endfreq;	///< End frequency for sweep
+    signal_e type;	///< Signal type
+    double bw;		///< Signal bandwidth
     union {
         struct synth_sin_params sin;
         struct synth_sqr_params sqr;
@@ -156,6 +156,7 @@ static int
 parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
 {
 
+    /* Signal type specific params */
     switch (gpp->type) {
     case eSignalSquare:
         if (strcmp(name, "dcycle") == 0) {
@@ -165,16 +166,6 @@ parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
             if (dcycle <= 0.0 || dcycle >= 1.0)
                 return (-1);
             gpp->opts.sqr.dcycle = dcycle;
-            return (0);
-        }
-        if (strcmp(name, "bw") == 0) {
-            double bw;
-
-            bw = strtod(value, NULL);
-            if (bw <= 0 || bw > c_max_frequency) {
-                return (-1);
-            }
-            gpp->opts.sqr.bw = bw;
             return (0);
         }
         break;
@@ -193,6 +184,17 @@ parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
         gpp->dc_off = dc_off;
         return (0);
     }
+    if (strcmp(name, "bw") == 0) {
+        double bw;
+
+        bw = strtod(value, NULL);
+        if (bw <= 0 || bw > c_max_frequency) {
+            return (-1);
+        }
+        gpp->bw = bw;
+        return (0);
+    }
+
     return (-1);
 }
 
@@ -234,13 +236,13 @@ int main(int argc, char *argv[])
     /* Signal type argument parsing */
     gparams.type = eSignalSine;
     gparams.dc_off = 0.0;
+    gparams.bw = c_max_frequency;
     if (argc > 4) {
         if ( strcmp(argv[4], "sine") == 0) {
             gparams.type = eSignalSine;
         } else if ( strcmp(argv[4], "sqr") == 0) {
             gparams.type = eSignalSquare;
             gparams.opts.sqr.dcycle = 0.5;
-            gparams.opts.sqr.bw = c_max_frequency;
         } else if ( strcmp(argv[4], "tri") == 0) {
             gparams.type = eSignalTriangle;
         } else if ( strcmp(argv[4], "sweep") == 0) {
@@ -284,6 +286,54 @@ int main(int argc, char *argv[])
     write_data_fpga(ch, data, &awg_params);
 }
 
+static void
+low_pass_filter(double *ddata, double bwlim, double srate)
+{
+    kiss_fftr_cfg config;
+    kiss_fft_cpx *spectrum;
+    int i, splen;
+    double freq, freq1;
+
+    if (srate / 2.0 <= bwlim) {
+        /*
+         * Nyquist frequency is already lower than our target
+         * limit, nothing to do really.
+         */
+        return;
+    }
+
+    config = kiss_fftr_alloc(n, 0, NULL, NULL);
+    splen = (n / 2) + 1;
+    spectrum = (kiss_fft_cpx *)malloc(sizeof(kiss_fft_cpx) * splen);
+    memset(spectrum, '\0', sizeof(kiss_fft_cpx) * splen);
+
+    kiss_fftr(config, (kiss_fft_scalar *)ddata, spectrum);
+    kiss_fftr_free(config);
+    freq1 = srate / (double)n;
+
+    for (i = 0; i < splen; i++) {
+        /*
+         * Scale down spectrum, seems to be necessary for the
+         * kiss_fftri to produce correct result.
+         */ 
+        spectrum[i].r /= (double)n;
+        spectrum[i].i /= (double)n;
+        freq = freq1 * i;
+        if (freq <= bwlim) {
+            continue;
+        }
+        /* Erase any bands above our target cut-off frequency */
+        spectrum[i].r = 0.0;
+        spectrum[i].i = 0.0;
+    }
+
+    config = kiss_fftr_alloc(n, 1, NULL, NULL);
+    kiss_fftri(config, spectrum, ddata);
+    free(spectrum);
+    kiss_fftr_free(config);
+    return;
+}
+
 /**
  * Synthesize a desired signal.
  *
@@ -302,8 +352,8 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
                        awg_param_t *awg) {
 
     uint32_t i;
-    double y_thrs, rdata;
-    struct recfilter lp_fil;
+    double y_thrs, dsample;
+    double ddata[n];
 
     /* Various locally used constants - HW specific parameters */
     const int dcoffs = -155;
@@ -313,20 +363,8 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
     awg->step = round(65536 * gpp->freq/c_awg_smpl_freq * n);
     awg->wrap = round(65536 * (n-1));
 
-    uint32_t amp = gpp->ampl * 8000.0 / 2;    /* 1 Vpp ==> 8000 DAC counts, from -4000 to 4000 */
-    int32_t dc_of = gpp->dc_off * 8000.0;
-    if (amp + abs(dc_of) > 8191) {
-        /* Truncate to max value if needed */
-        amp = 8191 - abs(dc_of);
-    }
-
     if (gpp->type == eSignalSquare) {
-        double srate, fcoeff;
-
-        srate = gpp->freq * (double)n;
-        fcoeff = calc_f_coef(srate, gpp->opts.sqr.bw);
         y_thrs = cos(gpp->opts.sqr.dcycle * M_PI);
-        recfilter_init(&lp_fil, fcoeff, amp, 0);
     }
 
     /* Fill data[] with appropriate buffer samples */
@@ -334,22 +372,22 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
         
         /* Sine */
         if (gpp->type == eSignalSine) {
-            data[i] = round(amp * cos(2*M_PI*(double)i/(double)n));
+            dsample =  0.5 * gpp->ampl * cos(2*M_PI*(double)i/(double)n);
         }
  
         /* Square */
         if (gpp->type == eSignalSquare) {
-            rdata = cos(2*M_PI*(double)i/(double)n);
-            if (rdata > y_thrs) {
-                data[i] = round(recfilter_apply_int(&lp_fil, amp));
+            dsample = cos(2*M_PI*(double)i/(double)n);
+            if (dsample > y_thrs) {
+                dsample = 0.5 * gpp->ampl;
             } else {
-                data[i] = round(recfilter_apply_int(&lp_fil, -amp));
+                dsample = -0.5 * gpp->ampl;
             }
         }
         
         /* Triangle */
         if (gpp->type == eSignalTriangle) {
-            data[i] = round(-1.0*(double)amp*(acos(cos(2*M_PI*(double)i/(double)n))/M_PI*2-1));
+            dsample = -0.5 * gpp->ampl *(acos(cos(2*M_PI*(double)i/(double)n))/M_PI*2-1);
         }
 
         /* Sweep */
@@ -362,10 +400,26 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
             double t = i / sampFreq; // This particular sample
             double T = n / sampFreq; // Wave period = # samples / sample frequency
             /* Actual formula. Frequency changes from start to end. */
-            data[i] = round(amp * (sin((start*T)/log(end/start) * ((exp(t*log(end/start)/T)-1)))));
+            dsample = 0.5 * gpp->ampl * (sin((start*T)/log(end/start) * ((exp(t*log(end/start)/T)-1))));
         }
         /* Add DC offset */
-        data[i] += dc_of;
+        dsample += gpp->dc_off;
+        ddata[i] = dsample;
+    }
+
+    /* Apply anti-aliasing/bw filter to the signal */
+    low_pass_filter(ddata, gpp->bw, gpp->freq * (double)n);
+
+    /* Convert into format that the DAC can eat */
+    for (i = 0; i < n; i++) {
+        /* 1 Vpp ==> 8000 DAC counts, from -4000 to 4000 */
+        data[i] = round(ddata[i] * 8000.0);
+        if (abs(data[i]) > 8191) {
+            /* Truncate to max value if needed */
+            fprintf(stderr, "Warning: data overflow detected at sample #%d, value %d, truncating to %s8191\n",
+              i, data[i], data[i] < 0 ? "-" : "");
+            data[i] = data[i] > 0 ? 8191 : -8191;
+        }
  
         /* TODO: Remove, not necessary in C/C++. */
         if(data[i] < 0)
