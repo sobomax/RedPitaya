@@ -178,7 +178,7 @@ parse_nvparam(struct generate_params *gpp, const char *name, const char *value)
         double dc_off;
 
         dc_off = strtod(value, NULL);
-        if (fabs(dc_off) + gpp->ampl > c_max_amplitude) {
+        if ((2.0 * fabs(dc_off)) + gpp->ampl > c_max_amplitude) {
             return (-1);
         }
         gpp->dc_off = dc_off;
@@ -413,7 +413,7 @@ void synthesize_signal(struct generate_params *gpp, int32_t *data,
     /* Convert into format that the DAC can eat */
     for (i = 0; i < n; i++) {
         /* 1 Vpp ==> 8000 DAC counts, from -4000 to 4000 */
-        data[i] = round(ddata[i] * 4000.0);
+        data[i] = round(ddata[i] * 8000.0);
         if (abs(data[i]) > 8191) {
             /* Truncate to max value if needed */
             fprintf(stderr, "Warning: data overflow detected at sample #%d, value %d, truncating to %s8191\n",
